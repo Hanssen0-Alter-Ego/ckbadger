@@ -32,9 +32,11 @@ fn main() {
             );
             format!("sha-{}", &actual[..12])
         }
-        Err(env::VarError::NotPresent) => {
-            build_version_format::format_build_version(&semver, branch_name.as_deref(), &commit_hash)
-        }
+        Err(env::VarError::NotPresent) => build_version_format::format_build_version(
+            &semver,
+            branch_name.as_deref(),
+            &commit_hash,
+        ),
         Err(error) => panic!("invalid CKBADGER_DOCKER_SHA: {error}"),
     };
 
