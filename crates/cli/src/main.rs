@@ -2561,6 +2561,10 @@ mod tests {
     fn test_cli_version_uses_semver_optional_branch_and_commit_hash() {
         let cmd = Cli::command();
         let version = cmd.get_version().expect("cli version should be present");
+        if let Some(sha) = option_env!("CKBADGER_DOCKER_SHA") {
+            assert_eq!(version, format!("sha-{}", &sha[..12]));
+            return;
+        }
         let (version_prefix, hash) = version
             .rsplit_once('@')
             .expect("version should contain a single '@'");

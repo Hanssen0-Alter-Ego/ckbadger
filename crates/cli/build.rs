@@ -20,8 +20,23 @@ fn main() {
         "git rev-parse --short HEAD returned an empty commit hash"
     );
 
-    let build_version =
-        build_version_format::format_build_version(&semver, branch_name.as_deref(), &commit_hash);
+    println!("cargo:rerun-if-env-changed=CKBADGER_DOCKER_SHA");
+    let build_version = match env::var("CKBADGER_DOCKER_SHA") {
+        Ok(expected) => {
+            let actual = git_stdout(&manifest_dir, &["rev-parse", "HEAD"]);
+            assert!(
+                expected.len() == 40
+                    && expected.bytes().all(|b| b.is_ascii_hexdigit())
+                    && expected == actual,
+                "CKBADGER_DOCKER_SHA must equal the full checked-out commit SHA"
+            );
+            format!("sha-{}", &actual[..12])
+        }
+        Err(env::VarError::NotPresent) => {
+            build_version_format::format_build_version(&semver, branch_name.as_deref(), &commit_hash)
+        }
+        Err(error) => panic!("invalid CKBADGER_DOCKER_SHA: {error}"),
+    };
 
     println!("cargo:rustc-env=CKBADGER_BUILD_VERSION={}", build_version);
 

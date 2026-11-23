@@ -75,7 +75,19 @@ jobs:
         run: pnpm install --frozen-lockfile && pnpm build
 
       - name: Build release binary
-        run: cargo build --release -j 2 -p ckbadger
+        env:
+          SOURCE_REVISION: ${{ steps.source.outputs.revision }}
+        run: |
+          unset CKBADGER_DOCKER_SHA
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            # This file is from the selected historical checkout, not workflow HEAD.
+            if ! grep -q 'cargo:rerun-if-env-changed=CKBADGER_DOCKER_SHA' crates/cli/build.rs; then
+              echo '::error::Selected revision predates Docker SHA binary version support; select a newer commit.'
+              exit 1
+            fi
+            export CKBADGER_DOCKER_SHA="$SOURCE_REVISION"
+          fi
+          cargo build --release -j 2 -p ckbadger
 
       - name: Package Docker image
         env:
@@ -94,9 +106,20 @@ jobs:
             --label "org.opencontainers.image.version=$version_label" \
             "$context"
 
+      - name: Verify Docker binary version
+        env:
+          SOURCE_REVISION: ${{ steps.source.outputs.revision }}
+        run: |
+          actual=$(docker run --rm ckbadger:ci --version)
+          printf '%s\n' "$actual"
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]] &&
+             [[ "$actual" != "ckbadger sha-${SOURCE_REVISION:0:12}" ]]; then
+            echo '::error::Docker binary version does not match the selected source revision.'
+            exit 1
+          fi
+
       - name: Smoke-test packaged frontend
         run: |
-          docker run --rm ckbadger:ci --version
           # The existing test hosts deterministic fixtures on the runner's loopback.
           # Mount only its temporary workdir and run as the runner UID to read it.
           launcher="$(mktemp)"

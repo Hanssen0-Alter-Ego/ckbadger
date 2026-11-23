@@ -190,6 +190,13 @@ CKBadger is designed local-first, but the architecture doesn't lock you in. The 
 
 #### Docker (Linux amd64)
 
+Manual Docker builds publish `sha-<12>` images whose `ckbadger --version`
+reports exactly `ckbadger sha-<12>` for the selected source commit. Historical
+commits predating Docker SHA binary version support are rejected; select a
+newer commit instead. The packaged version is checked before publishing.
+Existing immutable SHA images are not replaced. Version-tagged Docker builds
+and standalone binary releases retain their existing version format.
+
 Use a CKBadger workdir writable by UID/GID 1000 and CKB node directories
 readable by that user. Use the same CKBadger workdir for `init` and `run`.
 
