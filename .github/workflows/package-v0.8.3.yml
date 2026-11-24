@@ -88,6 +88,7 @@ jobs:
         with:
           artifact-ids: ${{ needs.package.outputs.artifact-id }}
           path: ${{ runner.temp }}/tested-image
+          merge-multiple: true
 
       - name: Verify and load the tested image
         id: verify
