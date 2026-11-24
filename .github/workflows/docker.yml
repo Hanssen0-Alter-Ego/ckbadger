@@ -16,8 +16,41 @@ permissions:
   contents: read
 
 jobs:
+  changes:
+    name: Detect image inputs
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      image: ${{ steps.filter.outputs.source == 'true' || steps.filter.outputs.metadata == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@v3
+        id: filter
+        if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref_type == 'branch')
+        with:
+          predicate-quantifier: every
+          filters: |
+            source:
+              - '**'
+              - '!docs/**'
+              - '!frontend/docs/**'
+              - '!README.md'
+              - '!AGENTS.md'
+              - '!CLAUDE.md'
+              - '!LICENSE'
+            # These are runtime inputs compiled into the binary, not prose.
+            metadata:
+              - 'docs/metadata/**'
+
   build:
     name: Build and smoke-test Linux amd64 image
+    needs: changes
+    # Keep the workflow/check present on docs-only PRs; skip only the expensive job.
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' || github.ref_type == 'tag' || needs.changes.outputs.image == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     outputs:
@@ -78,7 +111,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          node-version-file: package.json
           cache: pnpm
 
       - name: Build embedded frontend
@@ -157,6 +190,7 @@ jobs:
           path: ${{ runner.temp }}
 
       - name: Push tested release image
+        shell: bash
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SOURCE_REVISION: ${{ needs.build.outputs.revision }}
@@ -198,17 +232,21 @@ jobs:
             [[ "$existing_revision" == "$SOURCE_REVISION" ]] || fail "Existing immutable image $version has a different or unknown source revision."
           fi
 
+          # Publish/reuse the immutable tag before inspecting latest. A legacy
+          # latest must never prevent an independently usable version release.
+          if [[ -z "$version_digest" ]]; then
+            docker load -i "$RUNNER_TEMP/ckbadger-image.tar"
+            docker tag ckbadger:ci "$version"
+            docker push "$version"
+            version_digest=$(manifest_digest "$version")
+            [[ -n "$version_digest" ]] || fail "Cannot verify the newly published version $version."
+            printf 'Published %s.\n' "$version" >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf 'Reused immutable release %s.\n' "$version" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          printf '\nFirst-time GHCR packages are private by default. Set visibility to public if intended and verify an anonymous pull.\n' >> "$GITHUB_STEP_SUMMARY"
+
           if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
-            if [[ -z "$version_digest" ]]; then
-              docker load -i "$RUNNER_TEMP/ckbadger-image.tar"
-              docker tag ckbadger:ci "$version"
-              docker push "$version"
-              [[ -n "$(manifest_digest "$version")" ]] || fail "Cannot verify the newly published SHA image $version."
-              printf 'Published %s.\n' "$version" >> "$GITHUB_STEP_SUMMARY"
-            else
-              printf 'Reused immutable SHA image %s.\n' "$version" >> "$GITHUB_STEP_SUMMARY"
-            fi
-            printf '\nFirst-time GHCR packages are private by default. Set visibility to public if intended and verify an anonymous pull.\n' >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
@@ -232,23 +270,13 @@ jobs:
                   break
                 fi
               done <<< "$tags"
-              [[ -n "$current" ]] || fail 'Cannot identify the release behind legacy latest; no tags were changed.'
+              if [[ -z "$current" ]]; then
+                echo '::warning::Cannot identify legacy latest; keeping it unchanged.'
+                printf 'Kept %s unchanged: legacy release is unknown. Immutable %s is available.\n' "$latest" "$version" >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
             fi
           fi
-
-          # Do not overwrite a published version: it may be the only durable record
-          # that identifies a legacy latest, and a retry must reuse the same image.
-          if [[ -z "$version_digest" ]]; then
-            docker load -i "$RUNNER_TEMP/ckbadger-image.tar"
-            docker tag ckbadger:ci "$version"
-            docker push "$version"
-            version_digest=$(manifest_digest "$version")
-            [[ -n "$version_digest" ]] || fail "Cannot verify the newly published version $version."
-            printf 'Published %s.\n' "$version" >> "$GITHUB_STEP_SUMMARY"
-          else
-            printf 'Reused immutable release %s.\n' "$version" >> "$GITHUB_STEP_SUMMARY"
-          fi
-          printf '\nFirst-time GHCR packages are private by default. Set visibility to public if intended and verify an anonymous pull.\n' >> "$GITHUB_STEP_SUMMARY"
 
           highest=$(printf '%s\n%s\n' "$current" "$GITHUB_REF_NAME" | LC_ALL=C sort -V | tail -n 1)
           if [[ "$highest" != "$GITHUB_REF_NAME" ]]; then
