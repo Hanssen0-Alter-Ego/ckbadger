@@ -39,7 +39,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      # Python stdlib plus Git, Bash and jq (provided by the Ubuntu runner).
+      # Python stdlib plus Git and Bash (provided by the Ubuntu runner).
       - name: Test Docker branch and SHA guards offline
         run: python3 scripts/test_docker_source.py
 
