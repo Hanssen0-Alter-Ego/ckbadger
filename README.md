@@ -190,24 +190,6 @@ CKBadger is designed local-first, but the architecture doesn't lock you in. The 
 
 #### Docker (Linux amd64)
 
-Run the manual Docker workflow from the branch you want to test. Empty SHA input
-builds that branch's HEAD at dispatch time. An optional 7–40 digit SHA must name a
-commit in that event HEAD's history; commits only on another branch, in another
-fork, or newer than the event HEAD are not eligible. Select the other branch in
-the dispatch UI to build it. Manual dispatch from tags is rejected.
-
-The selected commit supplies all source, its own `Dockerfile`, and its own
-`scripts/test_frontend_release.py` and `scripts/test_docker_shutdown.sh`. Older
-commits missing these files fail with an explicit error; add compatible Docker
-build/test support on a branch first. Files are never borrowed from `main`.
-The source must also build with the workflow's toolchain and pass both smoke tests.
-Manual builds publish only immutable `sha-<12>` images with the full source SHA
-in the revision label; they do not change version tags or `latest`. Only run code
-from branches you trust: the build job has read-only permissions and checkout
-does not persist credentials; publishing runs in a separate package-write job.
-The selected branch also supplies the workflow YAML. These guards are workflow
-behavior, not a GitHub permission boundary against someone who can edit that YAML.
-
 Use a CKBadger workdir writable by UID/GID 1000 and CKB node directories
 readable by that user. Use the same CKBadger workdir for `init` and `run`.
 
@@ -246,6 +228,10 @@ Open `http://localhost:8100`.
 Keep the stop timeout when running under Docker. The supervisor handles
 `docker stop` by stopping its services in order, allowing up to 120 seconds
 per indexer to finish in-flight RocksDB writes and exit.
+
+Maintainers can optionally run the manual Docker workflow from a selected branch.
+Leave SHA blank to build its HEAD at dispatch time, or specify a SHA in that HEAD's history.
+It uses the selected commit's own Dockerfile and smoke tests and publishes only an immutable `sha-<12>` image, leaving `latest` unchanged.
 
 ### Work Directory Structure
 

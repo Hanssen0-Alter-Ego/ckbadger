@@ -28,6 +28,21 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  docker-workflow-tests:
+    name: Docker workflow offline tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      # Test this workflow revision, independently of Docker's historical checkout.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # Python stdlib plus Git, Bash and jq (provided by the Ubuntu runner).
+      - name: Test Docker branch and SHA guards offline
+        run: python3 scripts/test_docker_source.py
+
   changes:
     name: Detect Changes
     runs-on: ubuntu-latest
