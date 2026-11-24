@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       sha:
-        description: 'Commit SHA on main (7 to 40 hex digits). Empty uses the selected main HEAD.'
+        description: 'Commit SHA in the selected branch history (7 to 40 hex digits). Empty uses that branch HEAD at dispatch.'
         type: string
         required: false
   push:
@@ -34,8 +34,8 @@ jobs:
           REQUESTED_SHA: ${{ inputs.sha }}
         run: |
           if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
-            if [[ "$GITHUB_REF" != refs/heads/main ]]; then
-              echo '::error::Run manual Docker builds from main.'
+            if [[ "$GITHUB_REF" != refs/heads/* ]]; then
+              echo '::error::Run manual Docker builds from a branch, not a tag.'
               exit 1
             fi
             requested=${REQUESTED_SHA:-$GITHUB_SHA}
@@ -45,12 +45,23 @@ jobs:
             fi
             requested=${requested,,}
             if ! revision=$(git rev-parse --verify "$requested^{commit}") ||
-               [[ "$revision" != "$requested"* ]] ||
-               ! git merge-base --is-ancestor "$revision" "$GITHUB_SHA"; then
-              echo '::error::SHA must resolve to a commit in the selected main history.'
+               [[ "$revision" != "$requested"* ]]; then
+              echo '::error::SHA must resolve unambiguously to a commit.'
+              exit 1
+            fi
+            # Anchor to the event commit, not a branch head that may move during
+            # the run. Never fetch an arbitrary requested/fork-network SHA.
+            if ! git merge-base --is-ancestor "$revision" "$GITHUB_SHA"; then
+              echo '::error::SHA must be in the selected branch history at dispatch.'
               exit 1
             fi
             git checkout --detach "$revision"
+            for required in Dockerfile scripts/test_frontend_release.py scripts/test_docker_shutdown.sh; do
+              if [[ ! -f "$required" ]]; then
+                echo "::error::Selected source $revision lacks $required. Add Docker build/test support on a branch first."
+                exit 1
+              fi
+            done
           fi
           printf 'revision=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
@@ -130,7 +141,7 @@ jobs:
     name: Publish release image to GHCR
     if: >-
       (github.event_name == 'push' && github.ref_type == 'tag') ||
-      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+      (github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/'))
     needs: build
     runs-on: ubuntu-24.04
     # Queue every release. The lock covers both reading and updating :latest.

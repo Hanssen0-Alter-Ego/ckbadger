@@ -229,6 +229,10 @@ Keep the stop timeout when running under Docker. The supervisor handles
 `docker stop` by stopping its services in order, allowing up to 120 seconds
 per indexer to finish in-flight RocksDB writes and exit.
 
+Maintainers can optionally run the manual Docker workflow from a selected branch.
+Leave SHA blank to build its HEAD at dispatch time, or specify a SHA in that HEAD's history.
+It uses the selected commit's own Dockerfile and smoke tests and publishes only an immutable `sha-<12>` image, leaving `latest` unchanged.
+
 ### Work Directory Structure
 
 `ckbadger init` sets up an **orchestrator root**: a top-level `ckbadger.toml` plus one work directory per network. Each network subdirectory is a self-contained single-network work dir.
