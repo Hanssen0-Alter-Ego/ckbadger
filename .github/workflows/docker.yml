@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       sha:
-        description: 'Commit SHA on main (7 to 40 hex digits). Empty uses the selected main HEAD.'
+        description: 'Commit SHA reachable from a repository branch (7 to 40 hex digits). Empty uses the selected main HEAD.'
         type: string
         required: false
   push:
@@ -45,12 +45,25 @@ jobs:
             fi
             requested=${requested,,}
             if ! revision=$(git rev-parse --verify "$requested^{commit}") ||
-               [[ "$revision" != "$requested"* ]] ||
-               ! git merge-base --is-ancestor "$revision" "$GITHUB_SHA"; then
-              echo '::error::SHA must resolve to a commit in the selected main history.'
+               [[ "$revision" != "$requested"* ]]; then
+              echo '::error::SHA must resolve unambiguously to a commit.'
+              exit 1
+            fi
+            # checkout fetch-depth: 0 fetched this repository's branch heads.
+            # Do not fetch the requested SHA: GitHub can serve fork-network objects
+            # that are not reachable from any branch in this repository.
+            branches=$(git for-each-ref --format='%(refname)' --contains "$revision" refs/remotes/origin/)
+            if [[ -z "$branches" || "$branches" == refs/remotes/origin/HEAD ]]; then
+              echo '::error::SHA must be reachable from a pushed branch in this repository.'
               exit 1
             fi
             git checkout --detach "$revision"
+            for required in Dockerfile scripts/test_frontend_release.py scripts/test_docker_shutdown.sh; do
+              if [[ ! -f "$required" ]]; then
+                echo "::error::Selected source $revision lacks $required. Add Docker build/test support on a branch first."
+                exit 1
+              fi
+            done
           fi
           printf 'revision=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
