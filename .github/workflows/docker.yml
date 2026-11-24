@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       sha:
-        description: 'Commit SHA reachable from a repository branch (7 to 40 hex digits). Empty uses the selected main HEAD.'
+        description: 'Commit SHA in the selected branch history (7 to 40 hex digits). Empty uses that branch HEAD at dispatch.'
         type: string
         required: false
   push:
@@ -34,8 +34,8 @@ jobs:
           REQUESTED_SHA: ${{ inputs.sha }}
         run: |
           if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
-            if [[ "$GITHUB_REF" != refs/heads/main ]]; then
-              echo '::error::Run manual Docker builds from main.'
+            if [[ "$GITHUB_REF" != refs/heads/* ]]; then
+              echo '::error::Run manual Docker builds from a branch, not a tag.'
               exit 1
             fi
             requested=${REQUESTED_SHA:-$GITHUB_SHA}
@@ -49,12 +49,10 @@ jobs:
               echo '::error::SHA must resolve unambiguously to a commit.'
               exit 1
             fi
-            # checkout fetch-depth: 0 fetched this repository's branch heads.
-            # Do not fetch the requested SHA: GitHub can serve fork-network objects
-            # that are not reachable from any branch in this repository.
-            branches=$(git for-each-ref --format='%(refname)' --contains "$revision" refs/remotes/origin/)
-            if [[ -z "$branches" || "$branches" == refs/remotes/origin/HEAD ]]; then
-              echo '::error::SHA must be reachable from a pushed branch in this repository.'
+            # Anchor to the event commit, not a branch head that may move during
+            # the run. Never fetch an arbitrary requested/fork-network SHA.
+            if ! git merge-base --is-ancestor "$revision" "$GITHUB_SHA"; then
+              echo '::error::SHA must be in the selected branch history at dispatch.'
               exit 1
             fi
             git checkout --detach "$revision"
@@ -143,7 +141,7 @@ jobs:
     name: Publish release image to GHCR
     if: >-
       (github.event_name == 'push' && github.ref_type == 'tag') ||
-      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+      (github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/'))
     needs: build
     runs-on: ubuntu-24.04
     # Queue every release. The lock covers both reading and updating :latest.

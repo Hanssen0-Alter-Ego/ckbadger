@@ -59,11 +59,11 @@ class SourceTests(unittest.TestCase):
     def git(self, *args):
         return subprocess.check_output(['git', '-C', str(self.repo), *args], text=True, stderr=subprocess.DEVNULL).strip()
 
-    def resolve(self, sha='', event='workflow_dispatch', ref='refs/heads/main'):
+    def resolve(self, sha='', event='workflow_dispatch', ref='refs/heads/main', event_sha=None):
         self.output = self.root / 'output'
         self.output.write_text('')
         env = {**os.environ, 'GITHUB_OUTPUT': str(self.output), 'GITHUB_EVENT_NAME': event,
-               'GITHUB_REF': ref, 'GITHUB_SHA': self.main, 'REQUESTED_SHA': sha}
+               'GITHUB_REF': ref, 'GITHUB_SHA': event_sha or self.main, 'REQUESTED_SHA': sha}
         return subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', step('Resolve source revision')],
                               cwd=self.repo, env=env, capture_output=True, text=True)
 
@@ -79,7 +79,7 @@ class SourceTests(unittest.TestCase):
         self.assert_revision(self.resolve(self.main), self.main)
 
     def test_branch_only_abbreviated_uppercase_and_own_dockerfile(self):
-        self.assert_revision(self.resolve(self.branch[:12].upper()), self.branch)
+        self.assert_revision(self.resolve(self.branch[:12].upper(), ref='refs/heads/testing', event_sha=self.branch), self.branch)
         self.assertEqual((self.repo / 'Dockerfile').read_text(), 'branch Dockerfile\n')
 
     def test_compatible_historical_source(self):
@@ -100,20 +100,28 @@ class SourceTests(unittest.TestCase):
                 self.git('commit', '-m', 'missing support')
                 sha = self.git('rev-parse', 'HEAD')
                 self.git('update-ref', 'refs/remotes/origin/missing-support', sha)
-                r = self.resolve(sha)
+                r = self.resolve(sha, ref='refs/heads/missing-support', event_sha=sha)
                 self.assertNotEqual(r.returncode, 0)
                 self.assertIn('lacks ' + name, r.stdout)
 
     def test_local_tag_other_remote_and_pr_ref_are_not_branches(self):
         r = self.resolve(self.unpublished)
         self.assertNotEqual(r.returncode, 0)
-        self.assertIn('reachable from a pushed branch', r.stdout)
+        self.assertIn('selected branch history at dispatch', r.stdout)
         self.assertEqual(self.git('rev-parse', 'HEAD'), self.main)
 
-    def test_deleted_branch_is_not_eligible(self):
-        self.git('update-ref', '-d', 'refs/remotes/origin/testing')
+    def test_other_pushed_branch_is_not_eligible(self):
         r = self.resolve(self.branch)
         self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(self.git('rev-parse', 'HEAD'), self.main)
+
+    def test_empty_uses_selected_branch_event_head_even_if_ref_moves(self):
+        self.git('update-ref', 'refs/remotes/origin/testing', self.unpublished)
+        self.assert_revision(self.resolve(ref='refs/heads/testing', event_sha=self.branch), self.branch)
+        self.assertNotEqual(self.resolve(self.unpublished, ref='refs/heads/testing', event_sha=self.branch).returncode, 0)
+
+    def test_selected_branch_history(self):
+        self.assert_revision(self.resolve(self.historical, ref='refs/heads/testing', event_sha=self.branch), self.historical)
 
     def test_invalid_or_unknown_sha(self):
         for sha in ('main', '../main', 'a' * 6, 'f' * 41, 'f' * 40, '$(touch bad)'):
@@ -121,10 +129,10 @@ class SourceTests(unittest.TestCase):
                 self.assertNotEqual(self.resolve(sha).returncode, 0)
                 self.assertEqual(self.git('rev-parse', 'HEAD'), self.main)
 
-    def test_workflow_must_start_on_main(self):
-        r = self.resolve(self.branch, ref='refs/heads/testing')
+    def test_manual_workflow_must_start_on_branch(self):
+        r = self.resolve(self.branch, ref='refs/tags/v0.8.3', event_sha=self.branch)
         self.assertNotEqual(r.returncode, 0)
-        self.assertIn('Run manual Docker builds from main', r.stdout)
+        self.assertIn('from a branch, not a tag', r.stdout)
 
     def test_non_manual_uses_original_checkout(self):
         self.git('checkout', '--detach', self.old)
@@ -133,7 +141,7 @@ class SourceTests(unittest.TestCase):
                 self.assert_revision(self.resolve('invalid ignored', event, ref), self.old)
 
     def test_packaging_labels_use_selected_source(self):
-        self.assert_revision(self.resolve(self.branch), self.branch)
+        self.assert_revision(self.resolve(self.branch, ref='refs/heads/testing', event_sha=self.branch), self.branch)
         binary = self.repo / 'target/release/ckbadger'
         binary.parent.mkdir(parents=True)
         binary.write_text('branch binary')
@@ -156,6 +164,93 @@ class SourceTests(unittest.TestCase):
         self.assertIn('org.opencontainers.image.version=sha-' + self.branch[:12], args)
         self.assertIn('org.opencontainers.image.revision=' + self.branch, args)
         self.assertEqual(args[args.index('--file') + 1], 'Dockerfile')
+
+
+class PublishTests(unittest.TestCase):
+    def test_publish_job_guard(self):
+        from types import SimpleNamespace
+        section = WORKFLOW.split('  publish:', 1)[1]
+        expression = section.split('    if: >-\n', 1)[1].split('    needs:', 1)[0].strip()
+        expression = expression.replace('&&', 'and').replace('||', 'or').replace('\n', ' ')
+        cases = [
+            ('workflow_dispatch', 'branch', 'refs/heads/testing', True),
+            ('workflow_dispatch', 'branch', 'refs/heads/main', True),
+            ('workflow_dispatch', 'tag', 'refs/tags/v0.8.3', False),
+            ('pull_request', 'branch', 'refs/pull/1/merge', False),
+            ('push', 'branch', 'refs/heads/testing', False),
+            ('push', 'tag', 'refs/tags/v0.8.3', True),
+        ]
+        for event, kind, ref, expected in cases:
+            with self.subTest(event=event, ref=ref):
+                actual = eval(expression, {'__builtins__': {}}, {
+                    'github': SimpleNamespace(event_name=event, ref_type=kind, ref=ref),
+                    'startsWith': lambda value, prefix: value.startswith(prefix),
+                })
+                self.assertEqual(actual, expected)
+
+    def publish(self, mode):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        sha = '0123456789abcdef0123456789abcdef01234567'
+        shim = root / 'bin'
+        shim.mkdir()
+        for command in ('docker', 'skopeo'):
+            p = shim / command
+            p.write_text(r"""#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+root = Path(os.environ['FIXTURE_ROOT'])
+args = sys.argv[1:]
+with (root / 'calls').open('a') as f:
+    f.write(json.dumps([Path(sys.argv[0]).name, *args]) + '\n')
+assert not any(':latest' in arg or ':v0.' in arg for arg in args)
+mode = os.environ['FIXTURE_MODE']
+if Path(sys.argv[0]).name == 'skopeo':
+    revision = os.environ['SOURCE_REVISION'] if mode == 'reuse' else 'f' * 40
+    print(json.dumps({'Labels': {'org.opencontainers.image.revision': revision}}))
+elif args[0] == 'login':
+    sys.stdin.read()
+elif args[:3] == ['buildx', 'imagetools', 'inspect']:
+    if mode != 'new' or (root / 'pushed').exists():
+        print('sha256:' + 'a' * 64)
+    else:
+        print('ERROR: ' + args[-1] + ': not found', file=sys.stderr)
+        sys.exit(1)
+elif args[0] == 'push':
+    (root / 'pushed').touch()
+elif args[0] not in ('load', 'tag'):
+    raise AssertionError(args)
+""")
+            p.chmod(0o755)
+        env = {**os.environ, 'PATH': str(shim) + ':' + os.environ['PATH'],
+               'FIXTURE_ROOT': str(root), 'FIXTURE_MODE': mode, 'SOURCE_REVISION': sha,
+               'GITHUB_EVENT_NAME': 'workflow_dispatch', 'GITHUB_REF': 'refs/heads/testing',
+               'GITHUB_REF_NAME': 'testing', 'GITHUB_REPOSITORY': 'Example/Repo',
+               'GITHUB_ACTOR': 'fixture', 'GHCR_TOKEN': 'not-a-real-token',
+               'RUNNER_TEMP': str(root), 'GITHUB_STEP_SUMMARY': str(root / 'summary')}
+        result = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', step('Push tested release image')],
+                                env=env, text=True, capture_output=True)
+        import json
+        calls = [json.loads(line) for line in (root / 'calls').read_text().splitlines()]
+        return result, calls
+
+    def test_branch_dispatch_pushes_only_sha_image(self):
+        result, calls = self.publish('new')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(['docker', 'push', 'ghcr.io/example/repo:sha-0123456789ab'], calls)
+        self.assertEqual(sum(c[:2] == ['docker', 'push'] for c in calls), 1)
+
+    def test_existing_sha_is_reused_without_push(self):
+        result, calls = self.publish('reuse')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(any(c[:2] == ['docker', 'push'] for c in calls))
+
+    def test_sha_collision_is_rejected_without_push(self):
+        result, calls = self.publish('collision')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('different or unknown source revision', result.stderr)
+        self.assertFalse(any(c[:2] == ['docker', 'push'] for c in calls))
 
 
 if __name__ == '__main__':

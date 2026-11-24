@@ -190,10 +190,11 @@ CKBadger is designed local-first, but the architecture doesn't lock you in. The 
 
 #### Docker (Linux amd64)
 
-Run the manual Docker workflow from `main`, supplying a 7–40 digit commit SHA
-reachable from a pushed branch in this repository. Empty input uses the selected
-`main` HEAD. Branch reachability is checked against the heads fetched at checkout;
-SHAs only present in another fork, a PR ref, or a tag are not eligible.
+Run the manual Docker workflow from the branch you want to test. Empty SHA input
+builds that branch's HEAD at dispatch time. An optional 7–40 digit SHA must name a
+commit in that event HEAD's history; commits only on another branch, in another
+fork, or newer than the event HEAD are not eligible. Select the other branch in
+the dispatch UI to build it. Manual dispatch from tags is rejected.
 
 The selected commit supplies all source, its own `Dockerfile`, and its own
 `scripts/test_frontend_release.py` and `scripts/test_docker_shutdown.sh`. Older
@@ -204,6 +205,8 @@ Manual builds publish only immutable `sha-<12>` images with the full source SHA
 in the revision label; they do not change version tags or `latest`. Only run code
 from branches you trust: the build job has read-only permissions and checkout
 does not persist credentials; publishing runs in a separate package-write job.
+The selected branch also supplies the workflow YAML. These guards are workflow
+behavior, not a GitHub permission boundary against someone who can edit that YAML.
 
 Use a CKBadger workdir writable by UID/GID 1000 and CKB node directories
 readable by that user. Use the same CKBadger workdir for `init` and `run`.
