@@ -1,0 +1,290 @@
+name: Docker image
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'Commit SHA in the selected branch history (7 to 40 hex digits). Empty uses that branch HEAD at dispatch.'
+        type: string
+        required: false
+  push:
+    branches: [main]
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    name: Detect image inputs
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      image: ${{ steps.filter.outputs.source == 'true' || steps.filter.outputs.metadata == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@v3
+        id: filter
+        if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref_type == 'branch')
+        with:
+          predicate-quantifier: every
+          filters: |
+            source:
+              - '**'
+              - '!docs/**'
+              - '!frontend/docs/**'
+              - '!README.md'
+              - '!AGENTS.md'
+              - '!CLAUDE.md'
+              - '!LICENSE'
+            # These are runtime inputs compiled into the binary, not prose.
+            metadata:
+              - 'docs/metadata/**'
+
+  build:
+    name: Build and smoke-test Linux amd64 image
+    needs: changes
+    # Keep the workflow/check present on docs-only PRs; skip only the expensive job.
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' || github.ref_type == 'tag' || needs.changes.outputs.image == 'true') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      revision: ${{ steps.source.outputs.revision }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: ${{ github.event_name == 'workflow_dispatch' && '0' || '1' }}
+
+      - name: Resolve source revision
+        id: source
+        env:
+          REQUESTED_SHA: ${{ inputs.sha }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            if [[ "$GITHUB_REF" != refs/heads/* ]]; then
+              echo '::error::Run manual Docker builds from a branch, not a tag.'
+              exit 1
+            fi
+            requested=${REQUESTED_SHA:-$GITHUB_SHA}
+            if [[ ! "$requested" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
+              echo '::error::Expected a commit SHA (7 to 40 hex digits).'
+              exit 1
+            fi
+            requested=${requested,,}
+            if ! revision=$(git rev-parse --verify "$requested^{commit}") ||
+               [[ "$revision" != "$requested"* ]]; then
+              echo '::error::SHA must resolve unambiguously to a commit.'
+              exit 1
+            fi
+            # Anchor to the event commit, not a branch head that may move during
+            # the run. Never fetch an arbitrary requested/fork-network SHA.
+            if ! git merge-base --is-ancestor "$revision" "$GITHUB_SHA"; then
+              echo '::error::SHA must be in the selected branch history at dispatch.'
+              exit 1
+            fi
+            git checkout --detach "$revision"
+            for required in Dockerfile scripts/test_frontend_release.py scripts/test_docker_shutdown.sh; do
+              if [[ ! -f "$required" ]]; then
+                echo "::error::Selected source $revision lacks $required. Add Docker build/test support on a branch first."
+                exit 1
+              fi
+            done
+          fi
+          printf 'revision=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev libssl-dev zlib1g-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: docker-amd64
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: package.json
+          cache: pnpm
+
+      - name: Build embedded frontend
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile && pnpm build
+
+      - name: Build release binary
+        run: cargo build --release -j 2 -p ckbadger
+
+      - name: Package Docker image
+        env:
+          SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
+          SOURCE_REVISION: ${{ steps.source.outputs.revision }}
+        run: |
+          version_label=$GITHUB_REF_NAME
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            version_label="sha-${SOURCE_REVISION:0:12}"
+          fi
+          context="$(mktemp -d)"
+          install -m 0755 target/release/ckbadger "$context/ckbadger"
+          docker build --pull --file Dockerfile --tag ckbadger:ci \
+            --label "org.opencontainers.image.source=$SOURCE_URL" \
+            --label "org.opencontainers.image.revision=$SOURCE_REVISION" \
+            --label "org.opencontainers.image.version=$version_label" \
+            "$context"
+
+      - name: Smoke-test packaged frontend
+        run: |
+          docker run --rm ckbadger:ci --version
+          # The existing test hosts deterministic fixtures on the runner's loopback.
+          # Mount only its temporary workdir and run as the runner UID to read it.
+          launcher="$(mktemp)"
+          cat > "$launcher" <<'SH'
+          #!/bin/sh
+          set -eu
+          exec docker run --rm --init --network host \
+            --user "$(id -u):$(id -g)" \
+            --mount "type=bind,src=$PWD,dst=$PWD" \
+            ckbadger:ci "$@"
+          SH
+          chmod +x "$launcher"
+          python3 scripts/test_frontend_release.py --binary "$launcher"
+
+      - name: Smoke-test graceful Docker shutdown
+        run: bash scripts/test_docker_shutdown.sh ckbadger:ci
+
+      - name: Export tested image for release
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+        run: docker save -o "$RUNNER_TEMP/ckbadger-image.tar" ckbadger:ci
+
+      - uses: actions/upload-artifact@v4
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+        with:
+          name: ckbadger-image-amd64
+          path: ${{ runner.temp }}/ckbadger-image.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish release image to GHCR
+    if: >-
+      (github.event_name == 'push' && github.ref_type == 'tag') ||
+      (github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/'))
+    needs: build
+    runs-on: ubuntu-24.04
+    # Queue every release. The lock covers both reading and updating :latest.
+    concurrency:
+      group: ckbadger-ghcr-publish
+      queue: max
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ckbadger-image-amd64
+          path: ${{ runner.temp }}
+
+      - name: Push tested release image
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_REVISION: ${{ needs.build.outputs.revision }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          latest="$image:latest"
+          stable_tag='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          digest_pattern='^sha256:[0-9a-f]{64}$'
+          fail() { printf '::error::%s\n' "$1" >&2; exit 1; }
+          [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]] || fail 'Missing or invalid source revision.'
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            version="$image:sha-${SOURCE_REVISION:0:12}"
+          else
+            [[ "$GITHUB_REF_NAME" =~ $stable_tag ]] || fail 'Expected a stable vMAJOR.MINOR.PATCH tag.'
+            version="$image:$GITHUB_REF_NAME"
+          fi
+
+          printf '%s\n' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          authfile="${DOCKER_CONFIG:-$HOME/.docker}/config.json"
+
+          # Return an empty digest only for explicitly missing manifests.
+          manifest_digest() {
+            local ref="$1" output
+            if output=$(docker buildx imagetools inspect --format '{{printf "%s" .Manifest.Digest}}' "$ref" 2>&1); then
+              [[ "$output" =~ $digest_pattern ]] || fail "Invalid GHCR manifest digest for $ref."
+              printf '%s\n' "$output"
+            elif [[ "$output" != "ERROR: $ref: not found" ]] && ! grep -Fqi 'manifest unknown' <<< "$output"; then
+              printf '%s\n' "$output" >&2
+              fail "Cannot verify GHCR manifest for $ref."
+            fi
+          }
+          image_labels() {
+            skopeo inspect --no-tags --authfile "$authfile" "docker://$image@$1" | jq -c '.Labels // {}'
+          }
+
+          version_digest=$(manifest_digest "$version")
+          if [[ -n "$version_digest" ]]; then
+            existing_revision=$(image_labels "$version_digest" | jq -r '."org.opencontainers.image.revision" // empty')
+            [[ "$existing_revision" == "$SOURCE_REVISION" ]] || fail "Existing immutable image $version has a different or unknown source revision."
+          fi
+
+          # Publish/reuse the immutable tag before inspecting latest. A legacy
+          # latest must never prevent an independently usable version release.
+          if [[ -z "$version_digest" ]]; then
+            docker load -i "$RUNNER_TEMP/ckbadger-image.tar"
+            docker tag ckbadger:ci "$version"
+            docker push "$version"
+            version_digest=$(manifest_digest "$version")
+            [[ -n "$version_digest" ]] || fail "Cannot verify the newly published version $version."
+            printf 'Published %s.\n' "$version" >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf 'Reused immutable release %s.\n' "$version" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          printf '\nFirst-time GHCR packages are private by default. Set visibility to public if intended and verify an anonymous pull.\n' >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            exit 0
+          fi
+
+          latest_digest=$(manifest_digest "$latest")
+          current=
+          if [[ -n "$latest_digest" ]]; then
+            current=$(image_labels "$latest_digest" | jq -r '."org.opencontainers.image.version" // empty')
+            if [[ ! "$current" =~ $stable_tag ]]; then
+              # Legacy latest may carry the base OS version rather than the release.
+              # Query published GHCR tags; the matching Git tag may have been deleted.
+              tags=$(skopeo list-tags --authfile "$authfile" "docker://$image" |
+                jq -r '.Tags | if type == "array" then .[] else error("Invalid GHCR tags") end' |
+                LC_ALL=C sort -rV)
+              current=
+              while IFS= read -r tag; do
+                [[ "$tag" =~ $stable_tag ]] || continue
+                digest=$(manifest_digest "$image:$tag")
+                [[ -n "$digest" ]] || fail "A listed GHCR tag disappeared: $tag."
+                if [[ "$digest" == "$latest_digest" ]]; then
+                  current="$tag"
+                  break
+                fi
+              done <<< "$tags"
+              if [[ -z "$current" ]]; then
+                echo '::warning::Cannot identify legacy latest; keeping it unchanged.'
+                printf 'Kept %s unchanged: legacy release is unknown. Immutable %s is available.\n' "$latest" "$version" >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+            fi
+          fi
+
+          highest=$(printf '%s\n%s\n' "$current" "$GITHUB_REF_NAME" | LC_ALL=C sort -V | tail -n 1)
+          if [[ "$highest" != "$GITHUB_REF_NAME" ]]; then
+            printf 'Kept %s on newer release %s.\n' "$latest" "$current" >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "$version_digest" != "$latest_digest" ]]; then
+            skopeo copy --all --preserve-digests --authfile "$authfile" "docker://$image@$version_digest" "docker://$latest"
+            [[ "$(manifest_digest "$latest")" == "$version_digest" ]] || fail 'Cannot verify the promoted latest digest.'
+            printf 'Promoted %s to %s.\n' "$version" "$latest" >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf 'Kept %s on its existing digest.\n' "$latest" >> "$GITHUB_STEP_SUMMARY"
+          fi
