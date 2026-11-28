@@ -23,7 +23,9 @@ use ckbadger_store::types::{
 };
 use tracing::debug;
 
-use crate::parser::dotcell::{DotCellNameData, DotCellParser, DOTCELL_GRACE_SECONDS};
+use crate::parser::dotcell::{
+    DotCellLayout, DotCellNameData, DotCellParser, DOTCELL_GRACE_SECONDS,
+};
 use crate::parser::registry::{ProtocolScript, PROTOCOL_REGISTRY};
 
 use ckbadger_store::types::{LockCallEntry, TypeCallEntry};
@@ -190,8 +192,12 @@ pub(crate) fn is_expired_takeover(
 /// Diff the `.cell` names on both sides of a transaction.
 pub(crate) fn classify_dotcell_transitions(tx: &TxView<'_>) -> Result<Vec<DotCellTransition>> {
     let mut prev: BTreeMap<[u8; 20], &DotCellNameData> = BTreeMap::new();
+    let mut opaque_input = false;
     for input in &tx.inputs {
-        if let Some(name) = input.dotcell {
+        if matches!(input.dotcell, Some(DotCellLayout::Unsupported(_))) {
+            opaque_input = true;
+        }
+        if let Some(DotCellLayout::V3(name)) = input.dotcell {
             if prev.insert(name.id, name).is_some() {
                 bail!(
                     "dotcell id 0x{} consumed twice in tx 0x{}",
@@ -201,6 +207,7 @@ pub(crate) fn classify_dotcell_transitions(tx: &TxView<'_>) -> Result<Vec<DotCel
             }
         }
     }
+    let mut opaque_output = false;
     let mut next: BTreeMap<[u8; 20], DotCellNameData> = BTreeMap::new();
     for output in &tx.outputs {
         if !output
@@ -209,8 +216,15 @@ pub(crate) fn classify_dotcell_transitions(tx: &TxView<'_>) -> Result<Vec<DotCel
         {
             continue;
         }
-        let name = DotCellParser::parse_name_data(output.data)
-            .map_err(|e| anyhow!("tx 0x{}: {e}", hex::encode(tx.tx_hash)))?;
+        let name = match DotCellParser::classify_name_data(output.data)
+            .map_err(|e| anyhow!("tx 0x{}: {e}", hex::encode(tx.tx_hash)))?
+        {
+            DotCellLayout::V3(name) => name,
+            DotCellLayout::Unsupported(_) => {
+                opaque_output = true;
+                continue;
+            }
+        };
         let id = name.id;
         if next.insert(id, name).is_some() {
             bail!(
@@ -244,6 +258,10 @@ pub(crate) fn classify_dotcell_transitions(tx: &TxView<'_>) -> Result<Vec<DotCel
                     manager_changed_to: None,
                 }
             }
+            // The unseen side could carry the same name. Only report a
+            // registration or recycle when the opposite side is known.
+            (None, Some(_)) if opaque_input => continue,
+            (Some(_), None) if opaque_output => continue,
             (None, Some(name)) => DotCellTransition {
                 id,
                 label: name.label.clone(),
@@ -776,6 +794,7 @@ mod tests {
     use crate::db::writer::activities::{
         build_tx_actions_for_block_with_io, InputCellView, OutputCellView, TxView,
     };
+    use crate::parser::dotcell::DotCellLayout;
     use crate::parser::dotcell_fixtures::{CellFixture, TxFixture};
     use crate::parser::test_helpers::real_dotcell as fixture;
     use crate::parser::{DotCellNameData, DotCellParser, ScriptParser};
@@ -797,7 +816,7 @@ mod tests {
         type_script_hash: Option<Vec<u8>>,
         data: Vec<u8>,
         /// For inputs: the name this cell carried before it was spent.
-        dotcell: Option<DotCellNameData>,
+        dotcell: Option<DotCellLayout<DotCellNameData>>,
     }
 
     impl OwnedCell {
@@ -805,7 +824,7 @@ mod tests {
             let lock = cell.lock_script();
             let type_script = cell.type_script();
             let data = parse_hex_to_bytes(cell.data);
-            let dotcell = DotCellParser::parse_name_cell(&cell.output(), cell.data)
+            let dotcell = DotCellParser::classify_name_cell(&cell.output(), cell.data)
                 .expect("fixture name cell must decode");
             Self {
                 capacity: i64::from_str_radix(cell.capacity.trim_start_matches("0x"), 16)
@@ -838,7 +857,7 @@ mod tests {
                 udt_amount: None,
                 bit_cell_identity_id: None,
                 // Both sync paths carry this; the input itself has no data.
-                dotcell: self.dotcell.as_ref(),
+                dotcell: self.dotcell.as_ref().map(DotCellLayout::as_ref),
                 data: &[],
                 is_dao_withdraw_request: false,
                 dao_compensation: None,
@@ -892,6 +911,14 @@ mod tests {
                 outputs: self.outputs.iter().map(OwnedCell::output_view).collect(),
             }
         }
+    }
+
+    #[test]
+    fn unsupported_dotcell_input_does_not_imply_a_new_registration() {
+        let mut tx = OwnedTx::from_fixture(&fixture::T2_REGISTER_JOAOM);
+        tx.inputs[0].dotcell = Some(DotCellLayout::Unsupported(4));
+        let transitions = classify_dotcell_transitions(&tx.view()).unwrap();
+        assert!(transitions.is_empty());
     }
 
     fn hex20(hex: &str) -> [u8; 20] {
@@ -1405,7 +1432,7 @@ mod tests {
             type_args: Some(parse_hex_to_bytes(fixture::NAMESPACE_ARGS_MAINNET)),
             type_script_hash: Some(vec![0x02; 32]),
             data: data.clone(),
-            dotcell: as_input.then_some(name),
+            dotcell: as_input.then_some(DotCellLayout::V3(name)),
         }
     }
 

@@ -16,7 +16,7 @@ use crate::rpc::{parse_hex_to_bytes, CellOutput, TransactionView};
 
 pub use ckbadger_store::types::{DotCellNameData, DotCellRecord};
 
-/// The only layout version ever written on either network.
+/// The name layout this decoder understands.
 pub const DOTCELL_LAYOUT_VERSION: u8 = 3;
 /// Fixed header length; the label runs from here to the end of the data.
 pub const DOTCELL_HEADER_LEN: usize = 98;
@@ -43,6 +43,33 @@ pub const DOTCELL_ZERO_ID: [u8; 20] = [0u8; 20];
 pub const DOTCELL_SALE_LOCK_ARGS_LEN: usize = 40;
 /// The 30-day grace period the contract enforces after expiry, in seconds.
 pub const DOTCELL_GRACE_SECONDS: u64 = 2_592_000;
+
+/// A recognized account script can carry a layout this release cannot read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DotCellLayout<T> {
+    V3(T),
+    Unsupported(u8),
+}
+
+impl<T> DotCellLayout<T> {
+    pub fn as_ref(&self) -> DotCellLayout<&T> {
+        match self {
+            Self::V3(value) => DotCellLayout::V3(value),
+            Self::Unsupported(version) => DotCellLayout::Unsupported(*version),
+        }
+    }
+
+    fn require_v3(self) -> Result<T> {
+        match self {
+            Self::V3(value) => Ok(value),
+            Self::Unsupported(version) => bail!(
+                "dotcell layout version {version} unsupported (expected {DOTCELL_LAYOUT_VERSION})"
+            ),
+        }
+    }
+}
+
+pub type DotCellOutput = (usize, DotCellLayout<(DotCellNameData, Vec<DotCellRecord>)>);
 
 pub struct DotCellParser;
 
@@ -77,21 +104,21 @@ impl DotCellParser {
     /// [98..  ] label, UTF-8 ("" only on the ring root)
     /// ```
     ///
-    /// Anything that does not match is an error, not a cell to skip: a name
-    /// cell the indexer cannot decode is chain state it would silently lose.
+    /// Strict decode for callers that require a name.
     pub fn parse_name_data(data: &[u8]) -> Result<DotCellNameData> {
+        Self::classify_name_data(data)?.require_v3()
+    }
+
+    pub fn classify_name_data(data: &[u8]) -> Result<DotCellLayout<DotCellNameData>> {
+        if let Some(&version) = data.first().filter(|&&v| v != DOTCELL_LAYOUT_VERSION) {
+            return Ok(DotCellLayout::Unsupported(version));
+        }
+
         if data.len() < DOTCELL_HEADER_LEN {
             bail!(
                 "dotcell name data too short: len={} need>={}",
                 data.len(),
                 DOTCELL_HEADER_LEN
-            );
-        }
-        if data[0] != DOTCELL_LAYOUT_VERSION {
-            bail!(
-                "dotcell layout version {} unsupported (expected {})",
-                data[0],
-                DOTCELL_LAYOUT_VERSION
             );
         }
         let label = std::str::from_utf8(&data[DOTCELL_HEADER_LEN..])
@@ -100,7 +127,7 @@ impl DotCellParser {
         let mut expiry = [0u8; 8];
         expiry[..DOTCELL_EXPIRY_RANGE.len()].copy_from_slice(&data[DOTCELL_EXPIRY_RANGE]);
         let id = Self::derive_id(&label);
-        Ok(DotCellNameData {
+        Ok(DotCellLayout::V3(DotCellNameData {
             layout_version: data[DOTCELL_LAYOUT_VERSION_RANGE.start],
             records_hash: data[DOTCELL_RECORDS_HASH_RANGE]
                 .try_into()
@@ -111,7 +138,7 @@ impl DotCellParser {
             manager_hash20: data[DOTCELL_MANAGER_RANGE].try_into().expect("20 bytes"),
             label,
             id,
-        })
+        }))
     }
 
     /// blake2b of a records payload — the value a name cell stores in
@@ -290,24 +317,41 @@ impl DotCellParser {
     /// Live path: a raw RPC output plus its data hex. `Ok(None)` means the
     /// cell is not a name cell; `Err` means it is one and its data is wrong.
     pub fn parse_name_cell(output: &CellOutput, data_hex: &str) -> Result<Option<DotCellNameData>> {
+        Self::classify_name_cell(output, data_hex)?
+            .map(DotCellLayout::require_v3)
+            .transpose()
+    }
+
+    pub(crate) fn classify_name_cell(
+        output: &CellOutput,
+        data_hex: &str,
+    ) -> Result<Option<DotCellLayout<DotCellNameData>>> {
         let Some(type_script) = output.type_.as_ref() else {
             return Ok(None);
         };
         if !Self::is_account_type_script(&parse_hex_to_bytes(&type_script.code_hash)) {
             return Ok(None);
         }
-        Self::parse_name_data(&parse_hex_to_bytes(data_hex)).map(Some)
+        Self::classify_name_data(&parse_hex_to_bytes(data_hex)).map(Some)
     }
 
     /// Bulk path: an already-parsed cell. Same contract as `parse_name_cell`.
     pub fn parse_name_parsed_cell(cell: &ParsedCell) -> Result<Option<DotCellNameData>> {
+        Self::classify_name_parsed_cell(cell)?
+            .map(DotCellLayout::require_v3)
+            .transpose()
+    }
+
+    pub(crate) fn classify_name_parsed_cell(
+        cell: &ParsedCell,
+    ) -> Result<Option<DotCellLayout<DotCellNameData>>> {
         let Some(code_hash) = cell.type_code_hash.as_ref() else {
             return Ok(None);
         };
         if !Self::is_account_type_script(code_hash) {
             return Ok(None);
         }
-        Self::parse_name_data(&cell.data).map(Some)
+        Self::classify_name_data(&cell.data).map(Some)
     }
 
     /// Every name cell a transaction creates, with its records decoded from
@@ -321,9 +365,25 @@ impl DotCellParser {
     pub fn parse_name_cells_with_output_indices(
         tx: &TransactionView,
     ) -> Result<Vec<(usize, DotCellNameData, Vec<DotCellRecord>)>> {
+        Self::classify_name_outputs(tx)?
+            .into_iter()
+            .map(|(index, layout)| {
+                let (name, records) = layout.require_v3().map_err(|e| {
+                    anyhow!(
+                        "dotcell name cell parse failed: tx={}, output_index={index}: {e}",
+                        tx.hash
+                    )
+                })?;
+                Ok((index, name, records))
+            })
+            .collect()
+    }
+
+    /// Classify each account output before consulting its version-specific witness.
+    pub fn classify_name_outputs(tx: &TransactionView) -> Result<Vec<DotCellOutput>> {
         let mut out = Vec::new();
         for (index, (output, data_hex)) in tx.outputs.iter().zip(&tx.outputs_data).enumerate() {
-            let Some(name) = Self::parse_name_cell(output, data_hex).map_err(|e| {
+            let Some(name) = Self::classify_name_cell(output, data_hex).map_err(|e| {
                 anyhow!(
                     "dotcell name cell parse failed: tx={}, output_index={}: {e}",
                     tx.hash,
@@ -332,6 +392,13 @@ impl DotCellParser {
             })?
             else {
                 continue;
+            };
+            let name = match name {
+                DotCellLayout::V3(name) => name,
+                DotCellLayout::Unsupported(version) => {
+                    out.push((index, DotCellLayout::Unsupported(version)));
+                    continue;
+                }
             };
             let witness = tx.witnesses.get(index).ok_or_else(|| {
                 anyhow!(
@@ -349,7 +416,7 @@ impl DotCellParser {
                         index
                     )
                 })?;
-            out.push((index, name, records));
+            out.push((index, DotCellLayout::V3((name, records))));
         }
         Ok(out)
     }

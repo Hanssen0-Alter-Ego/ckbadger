@@ -628,7 +628,7 @@ fn indexer_tx_view(tx: &RpcTransactionView) -> ckbadger_indexer::rpc::Transactio
 }
 
 /// The `.cell` names a transaction creates, decoded by the exact function the
-/// live indexer runs (`DotCellParser::parse_name_cells_with_output_indices`).
+/// live indexer runs (`DotCellParser::classify_name_outputs`).
 ///
 /// A name cell whose own-index witness is missing or does not hash to the
 /// cell's records hash is an error, not an empty list: its type script was
@@ -638,12 +638,16 @@ fn indexer_tx_view(tx: &RpcTransactionView) -> ckbadger_indexer::rpc::Transactio
 fn dotcell_names_for_tx(
     tx: &RpcTransactionView,
 ) -> Result<Vec<DotCellNameWitnessResponse>, ApiRouteError> {
-    let names = ckbadger_indexer::parser::DotCellParser::parse_name_cells_with_output_indices(
-        &indexer_tx_view(tx),
-    )
-    .map_err(|e| ApiError::internal(format!("{e:#}")))?;
+    use ckbadger_indexer::parser::dotcell::DotCellLayout;
+    let names =
+        ckbadger_indexer::parser::DotCellParser::classify_name_outputs(&indexer_tx_view(tx))
+            .map_err(|e| ApiError::internal(format!("{e:#}")))?;
     Ok(names
         .into_iter()
+        .filter_map(|(i, layout)| match layout {
+            DotCellLayout::V3((name, records)) => Some((i, name, records)),
+            DotCellLayout::Unsupported(_) => None,
+        })
         .filter(|(_, name, _)| !name.is_root())
         .map(|(output_index, name, records)| DotCellNameWitnessResponse {
             output_index,

@@ -4164,14 +4164,20 @@ async fn test_assets_dotcell_ring_endpoint() {
         );
         batch.commit().unwrap();
     }
-    let config = test_config(store);
+    let config = test_config(store.clone());
     let app = create_router(config).await;
-    let (status, body) = dotcell_get(app, "/api/v1/assets/identities/dotcell/ring").await;
+    let (status, body) = dotcell_get(app.clone(), "/api/v1/assets/identities/dotcell/ring").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["namespaceArgs"], DOTCELL_NAMESPACE_MAINNET);
     assert_eq!(body["firstId"], SUPPORT_ID);
     assert_eq!(body["rootOutPoint"]["index"], 0);
     assert_eq!(body["liveCount"], 1);
+
+    let mut batch = StoreBatch::new(&store);
+    batch.put_consumed_cell_meta(&[0xA0; 32], 0, 20_515_882, 20_515_883, Some(&[0xA1; 32]));
+    batch.commit().unwrap();
+    let (status, _) = dotcell_get(app, "/api/v1/assets/identities/dotcell/ring").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

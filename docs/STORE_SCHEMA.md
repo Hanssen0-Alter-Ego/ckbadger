@@ -98,6 +98,17 @@ The other cell indexes (`cell_by_lock`, `cell_by_type`, `cell_by_data_hash`) are
 script hash or data hash, which already encodes `hash_type`, so they keep the 74-byte
 `hash(32) + block(8 BE) + outpoint(34)` shape.
 
+### Unsupported DotCell name layouts (0.8.3)
+
+A Cells Account outpoint whose layout byte is unsupported has a domain `stats_spore`
+row keyed by `0x30 ‖ encode_outpoint(tx_hash, output_index)`. Its value is the single
+layout byte. Only decoded v3 names and ring roots have the usual item-id mapping.
+Both live and bulk writes retain the ordinary cell indexes and payload. The marker
+survives consumption, and live rollback of its creating block removes it through
+the domain undo log. Existing v3 rows need no migration. The ring row retains
+the last decoded root for namespace and creation-height continuity. The ring API
+returns 404 if that outpoint has been consumed without a decoded successor.
+
 ### `identity_by_collection`: `.cell` parent→child rows
 
 Beside the `(sentinel, identity_id)` row every identity has, a `.cell` sub-name gets a second row

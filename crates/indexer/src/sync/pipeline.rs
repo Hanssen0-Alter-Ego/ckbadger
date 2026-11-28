@@ -778,7 +778,7 @@ fn parse_script_reference_hash_type(
 /// Collection id for a **consumed** object cell — the input side of the object
 /// daily deltas.
 ///
-/// This must agree, protocol for protocol, with the two other classifiers:
+/// For script-only collections this must agree with the two other classifiers:
 /// `dao_helpers::classify_object_collection_id` (the output/creation side) and
 /// `bulk_build::owners::object::classify_nft_collection_from_protocol` (bulk
 /// build). A protocol classified on creation but not on consumption leaves its

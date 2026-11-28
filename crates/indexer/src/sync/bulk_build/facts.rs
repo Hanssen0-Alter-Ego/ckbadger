@@ -9,7 +9,7 @@ use crate::parser::bit_cell::BitCellParser;
 use crate::parser::cell::ParsedCell;
 use crate::parser::did_ckb::DidCkbParser;
 use crate::parser::dotbit::{DotbitParser, DotbitWitnessBundle};
-use crate::parser::dotcell::{DotCellNameData, DotCellParser, DotCellRecord};
+use crate::parser::dotcell::{DotCellLayout, DotCellNameData, DotCellParser, DotCellRecord};
 use crate::parser::mnft::MnftParser;
 use crate::parser::spore::SporeParser;
 use crate::sync::types::InternId;
@@ -133,6 +133,7 @@ pub(crate) enum CellProtocolFacts {
     Dotbit(DotbitProtocolFacts),
     BitCell(BitCellProtocolFacts),
     DotCell(DotCellProtocolFacts),
+    UnsupportedDotCell(u8),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -361,7 +362,7 @@ pub(crate) fn parse_protocol_facts(
         | CellSemanticTag::Sudt
         | CellSemanticTag::Xudt => Ok(None),
         CellSemanticTag::DotCell => {
-            let name = DotCellParser::parse_name_parsed_cell(cell)
+            let name = DotCellParser::classify_name_parsed_cell(cell)
                 .map_err(|e| {
                     anyhow!(
                         "dotcell name cell parse failed: tx=0x{}, output_index={}: {e}",
@@ -376,6 +377,18 @@ pub(crate) fn parse_protocol_facts(
                         output_index
                     )
                 })?;
+            let namespace_args = parse_fixed_protocol_id::<20>(
+                cell.type_args.as_deref().unwrap_or(&[]),
+                "dotcell namespace args",
+                tx_hash,
+                output_index,
+            )?;
+            let name = match name {
+                DotCellLayout::V3(name) => name,
+                DotCellLayout::Unsupported(version) => {
+                    return Ok(Some(CellProtocolFacts::UnsupportedDotCell(version)))
+                }
+            };
             let witness = witness.ok_or_else(|| {
                 anyhow!(
                     "dotcell name cell has no witness at its output index: tx=0x{}, output_index={}",
@@ -391,12 +404,6 @@ pub(crate) fn parse_protocol_facts(
                     output_index
                 )
             })?;
-            let namespace_args = parse_fixed_protocol_id::<20>(
-                cell.type_args.as_deref().unwrap_or(&[]),
-                "dotcell namespace args",
-                tx_hash,
-                output_index,
-            )?;
             Ok(Some(CellProtocolFacts::DotCell(DotCellProtocolFacts {
                 name,
                 namespace_args,
