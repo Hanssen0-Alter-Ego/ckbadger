@@ -1,45 +1,49 @@
-# Package upstream CKBadger v0.8.3
+# Package the CKBadger 0.8.3 branch
 
-PRs targeting the fork's `0.8.3` branch can build and test this image without
-publishing anything. Merging into that branch in `Hanssen0/ckbadger` starts a
-fresh push run that builds, tests, and publishes only
-`ghcr.io/hanssen0/ckbadger:sha-da98312e44cd`. The `0.8.3` branch starts at the
-[upstream v0.8.3 commit](https://github.com/janx/ckbadger/tree/da98312e44cdc3655a6be8b3373caf293631e35a).
-The script fetches that exact commit separately, so adding packaging files
-does not change the source being built. This leaves the `main` branch and the `latest` and `v0.8.3`
-image tags untouched.
+Every push to `Hanssen0/ckbadger`'s `0.8.3` branch triggers packaging, even
+when the push changes only documentation. The build uses the exact tip
+commit from that push, not the branch's current tip when the job starts.
+A push containing several commits publishes one image for its tip commit.
+Different push SHAs have separate publish concurrency groups.
+
+After the Linux amd64 image passes its version, embedded frontend, and
+Docker shutdown tests, the workflow publishes it to
+`ghcr.io/hanssen0/ckbadger:sha-<first-12-hex-of-commit-sha>`. It does not move
+`latest` or `v0.8.3` or change the `main` branch. PRs into `0.8.3` build
+and test the proposed merge commit but never publish. Branch deletions
+do not build or publish an image.
 
 ## Before merging
 
-- If GitHub shows **Awaiting approval**, review the workflow changes, then choose
-  **Approve workflows to run** on the PR. Wait for the packaging check to pass.
-  It checks for `ckbadger 0.8.3@da98312e44cd` inside the Linux amd64 image and
-  runs the release's own embedded frontend smoke test and a Docker shutdown
-  fixture copied with the runtime recipe from the fork. Both copied files
-  are checksum-pinned.
-- Check that the existing GHCR package grants the `Hanssen0/ckbadger`
-  repository **Write** in the package's **Package settings → Manage Actions
-  access** (inherited access also works). The publish job uses GitHub's
-  short-lived token. No personal token is needed.
+- If GitHub shows **Awaiting approval**, review the workflow changes, then
+  choose **Approve workflows to run** on the PR. Wait for the packaging
+  check to pass.
+- Make sure the GHCR package gives `Hanssen0/ckbadger` **Write** access under
+  **Package settings → Manage Actions access** (inherited access also works).
+  Publishing uses the workflow's short-lived token, not a personal token.
 
-After merging, confirm the **Publish the tested upstream SHA to GHCR** job
-succeeds, then pull the image:
+After merging, wait for **Publish the tested push SHA to GHCR** to succeed.
+Copy the first 12 characters of the commit SHA from the push run (or copy the image reference from
+its summary):
 
 ```sh
-docker pull ghcr.io/hanssen0/ckbadger:sha-da98312e44cd
-docker run --rm --network none ghcr.io/hanssen0/ckbadger:sha-da98312e44cd --version
+sha="FIRST_12_HEX"  # Replace with the first 12 characters of the push run's SHA.
+image="ghcr.io/hanssen0/ckbadger:sha-$sha"
+docker pull "$image"
+docker run --rm --network none "$image" --version
 ```
 
-The publish job takes only the checksum-verified artifact from its own push
-build. It reuses an existing image only if the image configuration digest is
-identical; a different digest or unreadable tag fails without overwriting it.
-Do not otherwise push this SHA tag while the release job is running.
+The binary reports `ckbadger 0.8.3@<abbreviated-commit-sha>`. The publish
+job only uses the checksum-verified archive from the same push run and
+verifies the image's platform, OCI source and revision, and remote image
+configuration digest. If the SHA tag already exists, a matching digest is
+reused; a different digest or unreadable tag fails without overwriting it.
+Do not publish to the same SHA tag from outside this workflow.
 
 ## Artifact and local fallback
 
-Download **ckbadger-v0.8.3-linux-amd64-attempt-N** under **Artifacts** in a
-successful PR or push run (seven-day retention, where N is the workflow attempt).
-Unzip it, then run:
+Download **ckbadger-v0.8.3-linux-amd64-attempt-N** from a successful PR or
+push run (N is the workflow attempt; seven-day retention). Unzip it and run:
 
 ```sh
 sha256sum -c ckbadger-v0.8.3-linux-amd64.tar.sha256
@@ -47,21 +51,24 @@ docker load -i ckbadger-v0.8.3-linux-amd64.tar
 docker run --rm --network none ckbadger:0.8.3 --version
 ```
 
-If Actions cannot run, check out the PR head and use the same script on Ubuntu
-24.04 x86_64 with Docker, Git, Python 3, Node.js 24, pnpm 9.15.0, and stable
-Rust via rustup:
+Locally, check out the commit you want to package in a Git checkout. The
+script builds the committed files, recipe, and test fixtures from a clean
+detached worktree at that commit, not from staged or uncommitted edits.
+Use Ubuntu 24.04 x86_64 with Docker, Git, Python 3, Node.js 24, pnpm 9.15.0,
+and stable Rust via rustup:
 
 ```sh
 sudo apt-get install -y build-essential libclang-dev libssl-dev zlib1g-dev
 bash scripts/package-v0.8.3.sh ./package-v0.8.3
 ```
 
-The archive and checksum are written only after the tests pass. The upstream
-source commit is pinned, but v0.8.3 does not ship a Cargo lockfile, so builds
-are not guaranteed to be byte-identical.
+The archive and checksum are written only after the tests pass. The
+`0.8.3` branch does not track a Cargo lockfile, and the image uses an Ubuntu
+base tag, so rebuilds of the same commit are not guaranteed to be
+byte-identical.
 
-Loading the image does not change a running deployment or migrate its database.
-Do not mount the current fork build’s layout-8 RocksDB stores into upstream
-v0.8.3. Use a separate CKBadger workdir with fresh stores or a verified,
-compatible completed snapshot. Packaging alone does not validate a testnet
-re-index or recover an incomplete bulk build.
+Loading the image does not change a running deployment or migrate its
+database. Do not mount layout-8 RocksDB stores into a `0.8.3` build that
+does not support them. Use a separate CKBadger workdir with fresh stores
+or a verified, compatible completed snapshot. Packaging alone does not
+validate a testnet re-index or recover an incomplete bulk build.
