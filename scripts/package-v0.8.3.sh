@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly source_url=https://github.com/janx/ckbadger
-readonly revision=da98312e44cdc3655a6be8b3373caf293631e35a
+readonly source_url=https://github.com/Hanssen0/ckbadger
 readonly image=ckbadger:0.8.3
 readonly tarball=ckbadger-v0.8.3-linux-amd64.tar
-readonly recipe_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)/packaging/ckbadger-v0.8.3"
+repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 
 fail() { printf '%s\n' "$*" >&2; exit 1; }
 [[ $# = 1 ]] || fail "Usage: $0 OUTPUT_DIRECTORY"
@@ -21,33 +20,28 @@ output="$(cd -- "$1" && pwd -P)"
 [[ ! -e "$output/$tarball" && ! -e "$output/$tarball.sha256" ]] ||
     fail 'Remove or move the previous archive and checksum first.'
 
-# Refuse changes to the fork recipe and shutdown fixture verified at d0e72b6355ef.
-(
-    cd -- "$recipe_dir"
-    sha256sum --check --status <<'SUMS'
-42ed01faa7cfb1443913d162bdb1b43f0c7cf2a9dbb4a0727b23350ee1856984  Dockerfile
-5a24191f691a2a046cc7cd67b78ab741dc7dd98e3d283c023ddb8e33beeb9e2e  test_docker_shutdown.sh
-SUMS
-) || fail 'Packaging recipe or shutdown fixture differs from the pinned fork files.'
-
+# Use only this checkout's committed tree. Detach HEAD so the CLI's build.rs
+# keeps the real commit ID without adding a branch name to --version.
+revision="$(git -C "$repo" rev-parse --verify HEAD)"
 scratch="$(mktemp -d)"
-trap 'rm -rf -- "$scratch"' EXIT
 source="$scratch/source"
-git init --quiet "$source"
-# Public anonymous fetch; never use the PR branch or a mutable tag as source.
-GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/false git -C "$source" \
-    -c credential.helper= -c core.hooksPath=/dev/null fetch --no-tags --depth=1 \
-    "$source_url.git" "$revision"
-[[ $(git -C "$source" rev-parse FETCH_HEAD) == "$revision" ]] ||
-    fail 'Upstream checkout did not resolve to the pinned release commit.'
-git -C "$source" -c core.hooksPath=/dev/null checkout --quiet --detach "$revision"
+cleanup() {
+    if [[ -f "$source/.git" ]]; then
+        git -C "$repo" worktree remove --force "$source" || true
+    fi
+    rm -rf -- "$scratch"
+}
+trap cleanup EXIT
+git -C "$repo" -c core.hooksPath=/dev/null worktree add --quiet --detach "$source" "$revision"
+recipe_dir="$source/packaging/ckbadger-v0.8.3"
+short_revision="$(git -C "$source" rev-parse --short=12 HEAD)"
 
 (
     cd -- "$source/frontend"
     pnpm install --frozen-lockfile
     pnpm build
 )
-# Upstream v0.8.3 does not track Cargo.lock; mirror its release build.
+# The 0.8.3 branch does not track Cargo.lock.
 (
     cd -- "$source"
     CARGO_TARGET_DIR="$scratch/target" rustup run stable cargo build --release -j 2 -p ckbadger
@@ -63,12 +57,12 @@ docker build --pull --platform linux/amd64 --file "$recipe_dir/Dockerfile" --tag
 
 # Check the actual packaged executable, not just the image tag or OCI labels.
 actual="$(docker run --rm --network none "$image" --version)"
-expected="ckbadger 0.8.3@${revision:0:12}"
+expected="ckbadger 0.8.3@$short_revision"
 [[ $actual == "$expected" ]] || fail "Expected $expected, got: $actual"
 printf '%s\n' "$actual"
 
-# Use the pinned release's own deterministic loopback frontend fixture and the
-# verified fork's container/SIGINT fixture; neither needs a node or chain data.
+# Run the checked-out revision's loopback frontend and container shutdown
+# fixtures; neither needs a node or chain data.
 launcher="$scratch/run-packaged-frontend"
 cat > "$launcher" <<'SH'
 #!/bin/sh
